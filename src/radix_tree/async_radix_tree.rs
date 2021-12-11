@@ -4,19 +4,21 @@ use blake2b_simd::Params;
 use fnv::FnvHashMap;
 use futures::future::BoxFuture;
 use futures::stream::{poll_fn, BoxStream};
-use futures::{FutureExt, Stream, StreamExt};
+use futures::{Future, FutureExt, Stream, StreamExt};
 use lazy_static::lazy_static;
 use parking_lot::Mutex;
 use std::array::TryFromSliceError;
 use std::cmp::Ordering;
 use std::convert::{TryFrom, TryInto};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Poll;
 
 use super::IterKey;
 
 enum Blob2 {
     Heap(Arc<[u8]>),
-    Inline(u8, [u8;22]),
+    Inline(u8, [u8; 22]),
 }
 
 type Hash = [u8; 32];
@@ -24,18 +26,18 @@ type Blob = Arc<[u8]>;
 type Key = Arc<[u8]>;
 type Value = Arc<[u8]>;
 
-trait BlobStore: Send + Sync + std::fmt::Debug {
-    fn load(&self, hash: Hash) -> BoxFuture<'static, anyhow::Result<Blob>>;
-    fn store(&self, hash: Hash, value: &[u8]) -> BoxFuture<'static, anyhow::Result<()>>;
+pub trait BlobStore: Send + Sync + std::fmt::Debug {
+    fn load(&self, hash: Hash) -> BoxFuture<'_, anyhow::Result<Blob>>;
+    fn store(&self, hash: Hash, value: &[u8]) -> BoxFuture<'_, anyhow::Result<()>>;
 }
 
 #[derive(Debug, Clone, Default)]
-struct InMemBlobStore {
+pub struct InMemBlobStore {
     data: Arc<Mutex<FnvHashMap<Hash, Blob>>>,
 }
 
 impl BlobStore for InMemBlobStore {
-    fn load(&self, hash: Hash) -> BoxFuture<'static, anyhow::Result<Blob>> {
+    fn load(&self, hash: Hash) -> BoxFuture<'_, anyhow::Result<Blob>> {
         let dict = self.data.lock();
         let res = match dict.get(&hash) {
             Some(value) => Ok(value.clone()),
@@ -44,7 +46,7 @@ impl BlobStore for InMemBlobStore {
         futures::future::ready(res).boxed()
     }
 
-    fn store(&self, hash: Hash, value: &[u8]) -> BoxFuture<'static, anyhow::Result<()>> {
+    fn store(&self, hash: Hash, value: &[u8]) -> BoxFuture<'_, anyhow::Result<()>> {
         let mut dict = self.data.lock();
         dict.insert(hash, value.into());
         futures::future::ready(Ok(())).boxed()
@@ -112,14 +114,14 @@ impl Children {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Tree {
+pub struct Tree {
     prefix: Key,
     value: Option<Value>,
     children: Children,
 }
 
 impl Tree {
-    fn leaf(value: Value) -> Self {
+    pub fn leaf(value: Value) -> Self {
         Self {
             prefix: EMPTY_BLOB_ARC.clone(),
             value: Some(value),
@@ -127,7 +129,7 @@ impl Tree {
         }
     }
 
-    fn single(key: Key, value: Value) -> Self {
+    pub fn single(key: Key, value: Value) -> Self {
         Self {
             prefix: key,
             value: Some(value),
@@ -135,7 +137,7 @@ impl Tree {
         }
     }
 
-    fn prepend(&mut self, prefix: Key) {
+    pub fn prepend(&mut self, prefix: Key) {
         if !prefix.is_empty() {
             let mut t = Vec::with_capacity(self.prefix.len() + prefix.len());
             t.extend_from_slice(&self.prefix);
@@ -191,7 +193,7 @@ impl Tree {
         }
     }
 
-    fn empty() -> Self {
+    pub fn empty() -> Self {
         Self {
             prefix: EMPTY_BLOB_ARC.clone(),
             value: None,
@@ -200,11 +202,11 @@ impl Tree {
     }
 
     /// True if the tree is empty
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.children.is_empty() && self.value.is_none()
     }
 
-    fn union_with<'a>(
+    pub fn union_with<'a>(
         &'a mut self,
         that: &'a Tree,
         store: &'a TreeReader,
@@ -300,11 +302,11 @@ impl Tree {
         Ok(())
     }
 
-    fn ensure_hash(&mut self, store: &TreeWriter) -> BoxFuture<'_, anyhow::Result<()>> {
+    pub fn ensure_hash(&mut self, store: &TreeWriter) -> BoxFuture<'_, anyhow::Result<()>> {
         self.ensure_hash0(store.clone()).boxed()
     }
 
-    async fn ensure_data(&mut self, store: &TreeReader) -> anyhow::Result<()> {
+    pub async fn ensure_data(&mut self, store: &TreeReader) -> anyhow::Result<()> {
         if let Children::Hash(hash) = &self.children {
             let data = store.load(*hash).await?;
             self.children = Children::Both(*hash, data);
@@ -312,7 +314,7 @@ impl Tree {
         Ok(())
     }
 
-    async fn shrink(&mut self, store: &TreeWriter) -> anyhow::Result<()> {
+    pub async fn shrink(&mut self, store: &TreeWriter) -> anyhow::Result<()> {
         self.ensure_hash(store).await?;
         if let Children::Both(hash, _) = &self.children {
             self.children = Children::Hash(*hash);
@@ -320,12 +322,12 @@ impl Tree {
         Ok(())
     }
 
-    fn stream(
+    pub fn stream<'a>(
         &self,
-        store: &TreeReader,
-    ) -> impl Stream<Item = anyhow::Result<(IterKey<u8>, Blob)>> {
+        store: &'a TreeReader,
+    ) -> impl Stream<Item = anyhow::Result<(IterKey<u8>, Blob)>> + 'a {
         let prefix = IterKey(Arc::new(self.prefix.as_ref().into()));
-        EntryStream::new(self.clone(), prefix, store.clone()).as_stream()
+        EntryStream::new(self.clone(), prefix, store).as_stream()
     }
 
     fn prepend0(&mut self, prefix: &[u8]) {
@@ -445,14 +447,14 @@ impl Tree {
 ///
 /// A complication of this compared to an iterator for a normal collection is that the keys do
 /// not acutally exist, but are constructed on demand during iteration.
-pub struct EntryStream {
+pub struct EntryStream<'a> {
     path: IterKey<u8>,
     stack: Vec<(Tree, usize)>,
-    store: TreeReader,
+    store: &'a TreeReader,
 }
 
-impl EntryStream {
-    fn new(tree: Tree, prefix: IterKey<u8>, store: TreeReader) -> Self {
+impl<'a> EntryStream<'a> {
+    fn new(tree: Tree, prefix: IterKey<u8>, store: &'a TreeReader) -> Self {
         Self {
             stack: vec![(tree, 0)],
             path: prefix,
@@ -471,7 +473,7 @@ impl EntryStream {
         res
     }
 
-    async fn next(&mut self) -> Option<anyhow::Result<(IterKey<u8>, Blob)>> {
+    async fn next(mut self) -> Option<(anyhow::Result<(IterKey<u8>, Blob)>, EntryStream<'a>)> {
         while !self.stack.is_empty() {
             if let Some(pos) = self.inc() {
                 if let Err(e) = self
@@ -482,7 +484,7 @@ impl EntryStream {
                     .ensure_data(&self.store)
                     .await
                 {
-                    return Some(Err(e));
+                    return Some((Err(e), self));
                 }
                 if pos < self.tree().children().len() {
                     let child = self.tree().children()[pos].clone();
@@ -493,19 +495,16 @@ impl EntryStream {
                     self.stack.pop();
                 }
             } else if let Some(value) = self.tree().value.as_ref() {
-                return Some(Ok((self.path.clone(), value.clone())));
+                let path = self.path.clone();
+                let value = value.clone();
+                return Some((Ok((path, value)), self));
             }
         }
         None
     }
 
-    fn as_stream(mut self) -> BoxStream<'static, anyhow::Result<(IterKey<u8>, Blob)>> {
-        poll_fn(move |context| {
-            // TODO: avoid all this boxing
-            let mut future = self.next().boxed();
-            future.poll_unpin(context)
-        })
-        .boxed()
+    fn as_stream(self) -> BoxStream<'a, anyhow::Result<(IterKey<u8>, Blob)>> {
+        futures::stream::unfold(self, |x| x.next()).boxed()
     }
 }
 
@@ -515,19 +514,19 @@ fn common_prefix<'a, T: Eq>(a: &'a [T], b: &'a [T]) -> usize {
 }
 
 #[derive(Debug, Clone)]
-struct TreeReader(Arc<dyn BlobStore>);
+pub struct TreeReader(Arc<dyn BlobStore>);
 
 #[derive(Debug, Clone)]
-struct TreeWriter(Arc<dyn BlobStore>);
+pub struct TreeWriter(Arc<dyn BlobStore>);
 
 #[derive(Debug, Clone)]
-struct TreeStore {
-    reader: TreeReader,
-    writer: TreeWriter,
+pub struct TreeStore {
+    pub reader: TreeReader,
+    pub writer: TreeWriter,
 }
 
 impl TreeReader {
-    async fn load(&self, key: Hash) -> anyhow::Result<Arc<Vec<Tree>>> {
+    pub async fn load(&self, key: Hash) -> anyhow::Result<Arc<Vec<Tree>>> {
         let data = self.0.load(key).await?;
         let trees = Tree::from_bytes(data.as_ref())?;
         Ok(trees)
@@ -535,7 +534,7 @@ impl TreeReader {
 }
 
 impl TreeWriter {
-    async fn store(&self, trees: &[Tree]) -> anyhow::Result<Option<Hash>> {
+    pub async fn store(&self, trees: &[Tree]) -> anyhow::Result<Option<Hash>> {
         if trees.is_empty() {
             return Ok(None);
         }
@@ -552,10 +551,10 @@ impl TreeWriter {
 }
 
 impl TreeStore {
-    fn memory() -> Self {
+    pub fn memory() -> Self {
         Self::new(Arc::new(InMemBlobStore::default()))
     }
-    fn new(inner: Arc<dyn BlobStore>) -> Self {
+    pub fn new(inner: Arc<dyn BlobStore>) -> Self {
         Self {
             reader: TreeReader(inner.clone()),
             writer: TreeWriter(inner),
@@ -810,11 +809,5 @@ mod tests {
             let actual = to_std_map(&res, &store.reader);
             prop_assert_eq!(expected, actual);
         }
-    }
-
-    #[test]
-    fn foo() {
-        println!("{}", std::mem::size_of::<Blob2>());
-        println!("{}", std::mem::size_of::<Arc<[u8]>>());
     }
 }

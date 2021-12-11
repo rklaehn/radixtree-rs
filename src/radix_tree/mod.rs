@@ -42,6 +42,7 @@ use crate::merge_state::{
     VecMergeState,
 };
 mod async_radix_tree;
+pub use async_radix_tree::*;
 use binary_merge::MergeOperation;
 pub use flat_radix_tree::RadixTree;
 
