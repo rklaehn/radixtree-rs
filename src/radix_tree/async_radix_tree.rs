@@ -1,30 +1,42 @@
 use crate::merge_state::{CloneConverter, InPlaceVecMergeStateRef, MergeStateMut, MutateInput};
+use anyhow::Context;
 use binary_merge::MergeState;
 use blake2b_simd::Params;
 use fnv::FnvHashMap;
 use futures::future::BoxFuture;
-use futures::stream::{poll_fn, BoxStream};
-use futures::{Future, FutureExt, Stream, StreamExt};
+use futures::stream::BoxStream;
+use futures::{FutureExt, Stream, StreamExt, TryFutureExt};
 use lazy_static::lazy_static;
 use parking_lot::Mutex;
+use rand::RngCore;
+use salsa20::cipher::{NewCipher, StreamCipher};
+use salsa20::XSalsa20;
 use std::array::TryFromSliceError;
 use std::cmp::Ordering;
 use std::convert::{TryFrom, TryInto};
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::Poll;
 
 use super::IterKey;
 
-enum Blob2 {
-    Heap(Arc<[u8]>),
-    Inline(u8, [u8; 22]),
-}
+const SECRET_LEN: usize = 32;
+const HASH_LEN: usize = 32;
+const REGION_ID_LEN: usize = 16;
+const NONCE_LEN: usize = 24;
+const PUBLIC_REGION: RegionId = [0; REGION_ID_LEN];
 
-type Hash = [u8; 32];
+type Secret = [u8; SECRET_LEN];
+type Nonce = [u8; NONCE_LEN];
+type Hash = [u8; HASH_LEN];
+type RegionId = [u8; REGION_ID_LEN];
 type Blob = Arc<[u8]>;
 type Key = Arc<[u8]>;
 type Value = Arc<[u8]>;
+
+/// A region with common permissions
+#[derive(Debug, Clone)]
+pub struct Region {
+    secret: Secret,
+}
 
 pub trait BlobStore: Send + Sync + std::fmt::Debug {
     fn load(&self, hash: Hash) -> BoxFuture<'_, anyhow::Result<Blob>>;
@@ -34,6 +46,56 @@ pub trait BlobStore: Send + Sync + std::fmt::Debug {
 #[derive(Debug, Clone, Default)]
 pub struct InMemBlobStore {
     data: Arc<Mutex<FnvHashMap<Hash, Blob>>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TestSecretStore {}
+
+impl SecretStore for TestSecretStore {
+    fn region(&self, prefix: &[u8]) -> RegionId {
+        let mut res = [0; REGION_ID_LEN];
+        for i in 0..res.len().min(prefix.len()) {
+            res[i] = prefix[i];
+        }
+        res
+    }
+
+    fn random_nonce(&self) -> Nonce {
+        let mut nonce = [0u8; NONCE_LEN];
+        rand::thread_rng().fill_bytes(&mut nonce);
+        nonce
+    }
+
+    fn secret(&self, region: &RegionId) -> Option<Secret> {
+        let mut res = [0; SECRET_LEN];
+        for i in 0..res.len().min(region.len()) {
+            res[i] = region[i];
+        }
+        Some(res)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PublicSecretStore {}
+
+impl SecretStore for PublicSecretStore {
+    fn region(&self, _prefix: &[u8]) -> RegionId {
+        PUBLIC_REGION
+    }
+
+    fn random_nonce(&self) -> Nonce {
+        let mut nonce = [0u8; NONCE_LEN];
+        rand::thread_rng().fill_bytes(&mut nonce);
+        nonce
+    }
+
+    fn secret(&self, region: &RegionId) -> Option<Secret> {
+        if region == &PUBLIC_REGION {
+            Some([0; SECRET_LEN])
+        } else {
+            None
+        }
+    }
 }
 
 impl BlobStore for InMemBlobStore {
@@ -61,6 +123,7 @@ lazy_static! {
     static ref EMPTY_CHILDREN_ARC: Arc<Vec<Tree>> = Vec::new().into();
 }
 
+/// Utility to output something as hex
 struct Hex<'a>(&'a [u8]);
 
 impl<'a> std::fmt::Debug for Hex<'a> {
@@ -69,10 +132,21 @@ impl<'a> std::fmt::Debug for Hex<'a> {
     }
 }
 
+impl<'a> std::fmt::Display for Hex<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", hex::encode(self.0))
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 enum Children {
+    /// We just have the hash
     Hash(Hash),
+    /// We have just the data
+    ///
+    /// This with an empty vec also serves as the empty children.
     Data(Arc<Vec<Tree>>),
+    /// We have both
     Both(Hash, Arc<Vec<Tree>>),
 }
 
@@ -287,23 +361,39 @@ impl Tree {
         Ok(())
     }
 
-    async fn ensure_hash0(&mut self, store: TreeWriter) -> anyhow::Result<()> {
+    async fn ensure_hash_for_children(
+        &mut self,
+        mut prefix: IterKey<u8>,
+        store: TreeWriter,
+    ) -> anyhow::Result<IterKey<u8>> {
         if let Children::Data(data) = &mut self.children {
             if !data.is_empty() {
                 // we must recursively call ensure_hash
                 for child in Arc::make_mut(data) {
-                    child.ensure_hash(&store).await?;
+                    prefix.append(&child.prefix);
+                    prefix = child.ensure_hash0(prefix, store.clone()).await?;
+                    prefix.pop(child.prefix.len());
                 }
-                if let Some(hash) = store.store(data.as_ref()).await? {
+                if let Some(hash) = store.store(&prefix, data.as_ref()).await? {
                     self.children = Children::Both(hash, data.clone());
                 }
             }
         }
-        Ok(())
+        Ok(prefix)
+    }
+
+    fn ensure_hash0(
+        &mut self,
+        prefix: IterKey<u8>,
+        store: TreeWriter,
+    ) -> BoxFuture<'_, anyhow::Result<IterKey<u8>>> {
+        self.ensure_hash_for_children(prefix, store).boxed()
     }
 
     pub fn ensure_hash(&mut self, store: &TreeWriter) -> BoxFuture<'_, anyhow::Result<()>> {
-        self.ensure_hash0(store.clone()).boxed()
+        self.ensure_hash0(IterKey::new(&self.prefix), store.clone())
+            .map_ok(|_| ())
+            .boxed()
     }
 
     pub async fn ensure_data(&mut self, store: &TreeReader) -> anyhow::Result<()> {
@@ -339,6 +429,22 @@ impl Tree {
         }
     }
 
+    /// serialize a number of trees to bytes
+    ///
+    /// format:
+    /// -16 bit number of chilren (big endian)
+    /// -n *
+    ///   - 16 bit prefix len (big endian)
+    ///   - prefix bytes
+    /// -n *
+    ///   - 0u8 for no value
+    ///   - 1ua for value inline, followed by
+    ///     - 16 bit value len (big endian)
+    ///     - value bytes
+    /// - n *
+    ///   - 0u8 for no children
+    ///   - 1u8 for hash of children, followed by
+    ///     - 32 byte hash of children
     fn to_bytes(children: &[Tree]) -> anyhow::Result<Vec<u8>> {
         let mut res = Vec::new();
         let len = children.len();
@@ -399,7 +505,7 @@ impl Tree {
         }
         for _ in 0..len {
             hashes.push(match remaining.take::<1>()? {
-                &[1] => Children::Hash(*remaining.take::<32>()?),
+                &[1] => Children::Hash(*remaining.take::<HASH_LEN>()?),
                 &[0] => Children::Data(EMPTY_CHILDREN_ARC.clone()),
                 _ => {
                     anyhow::bail!("unexpected prefix");
@@ -513,12 +619,29 @@ fn common_prefix<'a, T: Eq>(a: &'a [T], b: &'a [T]) -> usize {
     a.iter().zip(b).take_while(|(a, b)| a == b).count()
 }
 
-#[derive(Debug, Clone)]
-pub struct TreeReader(Arc<dyn BlobStore>);
+pub trait SecretStore: Send + Sync + std::fmt::Debug {
+    /// get a region id for a prefix
+    fn region(&self, prefix: &[u8]) -> RegionId;
+
+    /// lookup a secret for a region id
+    fn secret(&self, region: &RegionId) -> Option<Secret>;
+
+    /// produce a random nonce
+    fn random_nonce(&self) -> Nonce;
+}
 
 #[derive(Debug, Clone)]
-pub struct TreeWriter(Arc<dyn BlobStore>);
+pub struct TreeReader(Arc<dyn BlobStore>, Arc<dyn SecretStore>);
 
+#[derive(Debug, Clone)]
+pub struct TreeWriter(Arc<dyn BlobStore>, Arc<dyn SecretStore>);
+
+/// A tree store that stores trees in a blob store.
+///
+/// The block format is:
+/// - lz4 compressed data, length prefixed and encrypted
+/// - 24 byte XSalsa nonce
+/// - 16 byte region id
 #[derive(Debug, Clone)]
 pub struct TreeStore {
     pub reader: TreeReader,
@@ -526,38 +649,79 @@ pub struct TreeStore {
 }
 
 impl TreeReader {
-    pub async fn load(&self, key: Hash) -> anyhow::Result<Arc<Vec<Tree>>> {
-        let data = self.0.load(key).await?;
-        let trees = Tree::from_bytes(data.as_ref())?;
+    /// Try to load a tree from a hash
+    pub async fn load(&self, hash: Hash) -> anyhow::Result<Arc<Vec<Tree>>> {
+        let data = self.0.load(hash).await?;
+        anyhow::ensure!(
+            data.len() >= NONCE_LEN + REGION_ID_LEN,
+            "blob must contain at least region id and nonce"
+        );
+        let region: &RegionId = &data[data.len() - REGION_ID_LEN..].try_into().unwrap();
+        let key = self
+            .1
+            .secret(&region)
+            .context("we don't have the secret for this region")?;
+        let nonce: &Nonce = &data
+            [data.len() - REGION_ID_LEN - NONCE_LEN..data.len() - REGION_ID_LEN]
+            .try_into()
+            .unwrap();
+        let mut encrypted: Vec<u8> = data[..data.len() - REGION_ID_LEN - NONCE_LEN].to_vec();
+        let mut cipher = XSalsa20::new(&key.into(), nonce.into());
+        cipher.apply_keystream(&mut encrypted);
+        let decompressed = lz4_flex::decompress_size_prepended(&encrypted)?;
+        let trees = Tree::from_bytes(decompressed.as_ref())?;
         Ok(trees)
     }
 }
 
 impl TreeWriter {
-    pub async fn store(&self, trees: &[Tree]) -> anyhow::Result<Option<Hash>> {
+    /// Store a tree at the given prefix
+    ///
+    /// the prefix is used to look up the region id to use for encryption
+    pub async fn store(&self, prefix: &[u8], trees: &[Tree]) -> anyhow::Result<Option<Hash>> {
         if trees.is_empty() {
             return Ok(None);
         }
+        let region = self.1.region(prefix);
+        let key = self
+            .1
+            .secret(&region)
+            .context("we don't have the secret for this region")?;
+        let nonce: Nonce = self.1.random_nonce();
+        let mut cipher = XSalsa20::new(&key.into(), &nonce.into());
         let data = Tree::to_bytes(trees)?;
+        let mut compressed = lz4_flex::compress_prepend_size(&data);
+        let c1 = compressed.clone();
+        cipher.apply_keystream(&mut compressed);
+        compressed.extend_from_slice(&nonce);
+        compressed.extend_from_slice(&region);
+
         let hash = Params::new()
-            .hash_length(32)
+            .hash_length(HASH_LEN)
             .to_state()
-            .update(&data)
+            .update(&compressed)
             .finalize();
         let hash = hash.as_bytes().try_into()?;
-        self.0.store(hash, &data).await?;
+        self.0.store(hash, &compressed).await?;
         Ok(Some(hash))
     }
 }
 
 impl TreeStore {
     pub fn memory() -> Self {
-        Self::new(Arc::new(InMemBlobStore::default()))
+        // Self::new(Arc::new(InMemBlobStore::default()), Arc::new(PublicSecretStore::default()))
+        Self::test()
     }
-    pub fn new(inner: Arc<dyn BlobStore>) -> Self {
+    pub fn test() -> Self {
+        Self::new(
+            Arc::new(InMemBlobStore::default()),
+            Arc::new(TestSecretStore::default()),
+        )
+    }
+    pub fn new(inner: Arc<dyn BlobStore>, secrets: Arc<dyn SecretStore>) -> Self {
         Self {
-            reader: TreeReader(inner.clone()),
-            writer: TreeWriter(inner),
+            reader: TreeReader(inner.clone(), secrets.clone()),
+            writer: TreeWriter(inner, secrets),
         }
     }
 }
@@ -665,7 +829,7 @@ mod tests {
     use proptest::prelude::*;
 
     fn arb_tree() -> impl Strategy<Value = Tree> {
-        any::<(Vec<u8>, Vec<u8>, [u8; 32])>().prop_map(|(key, value, hash)| {
+        any::<(Vec<u8>, Vec<u8>, [u8; HASH_LEN])>().prop_map(|(key, value, hash)| {
             let mut res = Tree::single(key.into(), value.into());
             res.children = Children::Hash(hash);
             res
